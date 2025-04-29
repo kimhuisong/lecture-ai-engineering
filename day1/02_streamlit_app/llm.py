@@ -1,23 +1,20 @@
 # llm.py
-import os
-import torch
-from transformers import pipeline
-import streamlit as st
-import time
-from config import MODEL_NAME
-from huggingface_hub import login
 
-# モデルをキャッシュして再利用
+import re
+import json
+import torch
+import streamlit as st
+from transformers import pipeline
+from config import MODEL_NAME
+
 @st.cache_resource
 def load_model():
-    """LLMモデルをロードする"""
+    """
+    LLMモデルをロードして返します
+    """
     try:
-
-        # アクセストークンを保存
-        hf_token = st.secrets["huggingface"]["token"]
-        
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        st.info(f"Using device: {device}") # 使用デバイスを表示
+        st.info(f"Using device: {device}")
         pipe = pipeline(
             "text-generation",
             model=MODEL_NAME,
@@ -28,60 +25,98 @@ def load_model():
         return pipe
     except Exception as e:
         st.error(f"モデル '{MODEL_NAME}' の読み込みに失敗しました: {e}")
-        st.error("GPUメモリ不足の可能性があります。不要なプロセスを終了するか、より小さいモデルの使用を検討してください。")
         return None
 
-def generate_response(pipe, user_question):
-    """LLMを使用して質問に対する回答を生成する"""
+
+def generate_quiz(pipe, genre: str, n: int):
+    """
+    ジャンル genre で n 問の一般知識クイズを生成し、
+    選択肢付き JSON リストを返します。
+    フォーマット:
+      [
+        {
+          "question": "...",
+          "options": ["A","B","C","D"],
+          "answer": 0  # options の正解インデックス
+        }, ...
+      ]
+    """
     if pipe is None:
-        return "モデルがロードされていないため、回答を生成できません。", 0
+        st.error("モデルがロードされていないため、クイズを生成できません。")
+        return []
+
+    # プロンプトに具体例を含め、4択形式を指定
+    prompt = (
+        f"ジャンル『{genre}』の一般知識クイズを{n}問作成してください。\n"
+        "各問題に4つの選択肢を用意し、正解は選択肢リストのインデックス(0～3)で示してください。\n"
+        "JSONのリスト形式で返してください。例：\n"
+        "[\n"
+        "  {\"question\":\"日本の首都はどこですか？\",\n"
+        "   \"options\":[\"大阪\",\"京都\",\"東京\",\"名古屋\"],\n"
+        "   \"answer\":2},\n"
+        "  {\"question\":\"光の速さは？\",\n"
+        "   \"options\":[\"3万km/s\",\"30万km/s\",\"300万km/s\",\"3000km/s\"],\n"
+        "   \"answer\":1}\n"
+        "]\n"
+    )
 
     try:
-        start_time = time.time()
-        messages = [
-            {"role": "user", "content": user_question},
-        ]
-        # max_new_tokensを調整可能にする（例）
-        outputs = pipe(messages, max_new_tokens=512, do_sample=True, temperature=0.7, top_p=0.9)
+        # モデル呼び出し
+        output = pipe(prompt, max_new_tokens=512)[0]["generated_text"]
 
-        # Gemmaの出力形式に合わせて調整が必要な場合がある
-        # 最後のassistantのメッセージを取得
-        assistant_response = ""
-        if outputs and isinstance(outputs, list) and outputs[0].get("generated_text"):
-           if isinstance(outputs[0]["generated_text"], list) and len(outputs[0]["generated_text"]) > 0:
-               # messages形式の場合
-               last_message = outputs[0]["generated_text"][-1]
-               if last_message.get("role") == "assistant":
-                   assistant_response = last_message.get("content", "").strip()
-           elif isinstance(outputs[0]["generated_text"], str):
-               # 単純な文字列の場合（古いtransformers？） - プロンプト部分を除く処理が必要かも
-               # この部分はモデルやtransformersのバージョンによって調整が必要
-               full_text = outputs[0]["generated_text"]
-               # 簡単な方法：ユーザーの質問以降の部分を取得
-               prompt_end = user_question
-               response_start_index = full_text.find(prompt_end) + len(prompt_end)
-               # 応答部分のみを抽出（より堅牢な方法が必要な場合あり）
-               possible_response = full_text[response_start_index:].strip()
-               # 特定の開始トークンを探すなど、モデルに合わせた調整
-               if "<start_of_turn>model" in possible_response:
-                    assistant_response = possible_response.split("<start_of_turn>model\n")[-1].strip()
-               else:
-                    assistant_response = possible_response # フォールバック
+        # JSON配列の部分をすべて抽出し、最後の要素を取得
+        lists = re.findall(r"\[.*?\]", output, re.S)
+        if not lists:
+            raise ValueError("JSONリストが見つかりませんでした")
+        json_str = lists[-1]
 
-        if not assistant_response:
-             # 上記で見つからない場合のフォールバックやデバッグ
-             print("Warning: Could not extract assistant response. Full output:", outputs)
-             assistant_response = "回答の抽出に失敗しました。"
+        # パース
+        try:
+            quiz_list = json.loads(json_str)
+        except json.JSONDecodeError:
+            # 末尾カンマを削除して再試行
+            cleaned = re.sub(r",\s*([\]\}])", r"\1", json_str)
+            quiz_list = eval(cleaned)
 
-
-        end_time = time.time()
-        response_time = end_time - start_time
-        print(f"Generated response in {response_time:.2f}s") # デバッグ用
-        return assistant_response, response_time
+        return quiz_list
 
     except Exception as e:
-        st.error(f"回答生成中にエラーが発生しました: {e}")
-        # エラーの詳細をログに出力
-        import traceback
-        traceback.print_exc()
-        return f"エラーが発生しました: {str(e)}", 0
+        st.error(f"クイズ生成中にエラーが発生しました: {e}")
+        if 'output' in locals():
+            st.error(f"@@ raw output start @@\n{output}\n@@ raw output end @@")
+        return []
+
+
+def check_quiz_answer(pipe, question: str, user_answer: str):
+    """
+    LLMに採点を依頼し、(メッセージ, 正誤フラグ(bool), 正答文字列)を返します。
+    自由記述式の採点が必要な場合に使用。
+    """
+    if pipe is None:
+        return "モデルがロードされていないため、採点できません。", False, ""
+
+    prompt = (
+        f"以下のクイズを採点してください。\n"
+        f"問題: {question}\n"
+        f"ユーザーの解答: {user_answer}\n"
+        "JSON形式で出力してください：{\"is_correct\":0 or 1, \"correct_answer\":\"...\"}"
+    )
+
+    try:
+        output = pipe(prompt, max_new_tokens=128)[0]["generated_text"]
+        m = re.search(r"\{.*?\}", output, re.S)
+        if not m:
+            raise ValueError("採点結果のJSONが見つかりませんでした")
+
+        result = json.loads(m.group(0))
+        is_correct = bool(result.get("is_correct", 0))
+        correct_answer = result.get("correct_answer", "")
+        message = "正解です！" if is_correct else f"不正解です。正答は『{correct_answer}』です。"
+
+        return message, is_correct, correct_answer
+
+    except Exception as e:
+        st.error(f"採点中にエラーが発生しました: {e}")
+        if 'output' in locals():
+            st.error(f"@@ raw output start @@\n{output}\n@@ raw output end @@")
+        return "採点に失敗しました。", False, ""
