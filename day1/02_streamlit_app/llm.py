@@ -45,40 +45,47 @@ def generate_quiz(pipe, genre: str, n: int):
         st.error("モデルがロードされていないため、クイズを生成できません。")
         return []
 
-    # プロンプトに具体例を含め、4択形式を指定
+    # プロンプト文を厳格化（不要な文章を出さないよう制約）
     prompt = (
-        f"ジャンル『{genre}』の一般知識クイズを{n}問作成してください。\n"
-        "各問題に4つの選択肢を用意し、正解は選択肢リストのインデックス(0～3)で示してください。\n"
-        "JSONのリスト形式で返してください。例：\n"
+        f"ジャンル「{genre}」の一般知識に関する4択クイズを{n}問、JSON形式のリストで出力してください。\n"
+        "以下の形式に従い、JSONリスト **のみ** を返してください。説明文や例、見出しを含めないでください。\n"
         "[\n"
-        "  {\"question\":\"日本の首都はどこですか？\",\n"
-        "   \"options\":[\"大阪\",\"京都\",\"東京\",\"名古屋\"],\n"
-        "   \"answer\":2},\n"
-        "  {\"question\":\"光の速さは？\",\n"
-        "   \"options\":[\"3万km/s\",\"30万km/s\",\"300万km/s\",\"3000km/s\"],\n"
-        "   \"answer\":1}\n"
-        "]\n"
+        "  {\"question\": \"日本の首都はどこですか？\", \"options\": [\"大阪\", \"京都\", \"東京\", \"名古屋\"], \"answer\": 2},\n"
+        "  {\"question\": \"光の速さは？\", \"options\": [\"3万km/s\", \"30万km/s\", \"300万km/s\", \"3000km/s\"], \"answer\": 1}\n"
+        "]"
     )
 
     try:
-        # モデル呼び出し
-        output = pipe(prompt, max_new_tokens=512)[0]["generated_text"]
+        output = pipe(prompt, max_new_tokens=1024)[0]["generated_text"]
 
-        # JSON配列の部分をすべて抽出し、最後の要素を取得
-        lists = re.findall(r"\[.*?\]", output, re.S)
-        if not lists:
-            raise ValueError("JSONリストが見つかりませんでした")
-        json_str = lists[-1]
+        # JSONリスト抽出を試みる（[]内の全体）
+        m = re.search(r'\[\s*{.*?}\s*\]', output, re.S)
+        if m:
+            json_str = m.group(0)
+        else:
+            # うまくパースできない場合、すべての { ... } を抽出して強引に整形
+            objs = re.findall(r'{\s*"question".*?}', output, re.S)
+            if not objs:
+                raise ValueError("有効なJSONオブジェクトが見つかりませんでした")
+            json_str = "[" + ",".join(objs) + "]"
 
-        # パース
+        # JSONデコード（末尾カンマ除去対応）
         try:
             quiz_list = json.loads(json_str)
         except json.JSONDecodeError:
-            # 末尾カンマを削除して再試行
-            cleaned = re.sub(r",\s*([\]\}])", r"\1", json_str)
+            cleaned = re.sub(r",\s*([\]}])", r"\1", json_str)
             quiz_list = eval(cleaned)
 
-        return quiz_list
+        # 各問題の形式確認
+        valid_quiz_list = []
+        for q in quiz_list:
+            if isinstance(q, dict) and 'question' in q and 'options' in q and 'answer' in q:
+                valid_quiz_list.append(q)
+
+        if not valid_quiz_list:
+            raise ValueError("問題データの形式が正しくありません")
+
+        return valid_quiz_list
 
     except Exception as e:
         st.error(f"クイズ生成中にエラーが発生しました: {e}")
@@ -89,8 +96,8 @@ def generate_quiz(pipe, genre: str, n: int):
 
 def check_quiz_answer(pipe, question: str, user_answer: str):
     """
-    LLMに採点を依頼し、(メッセージ, 正誤フラグ(bool), 正答文字列)を返します。
-    自由記述式の採点が必要な場合に使用。
+    自由記述形式の解答に対して、LLMに採点を依頼する。
+    出力形式: {"is_correct": 0 or 1, "correct_answer": "..."}
     """
     if pipe is None:
         return "モデルがロードされていないため、採点できません。", False, ""
@@ -99,7 +106,7 @@ def check_quiz_answer(pipe, question: str, user_answer: str):
         f"以下のクイズを採点してください。\n"
         f"問題: {question}\n"
         f"ユーザーの解答: {user_answer}\n"
-        "JSON形式で出力してください：{\"is_correct\":0 or 1, \"correct_answer\":\"...\"}"
+        "JSON形式で出力してください： {\"is_correct\": 0 or 1, \"correct_answer\": \"...\"}"
     )
 
     try:
@@ -111,7 +118,7 @@ def check_quiz_answer(pipe, question: str, user_answer: str):
         result = json.loads(m.group(0))
         is_correct = bool(result.get("is_correct", 0))
         correct_answer = result.get("correct_answer", "")
-        message = "正解です！" if is_correct else f"不正解です。正答は『{correct_answer}』です。"
+        message = "正解です！" if is_correct else f"不正解です。正答は「{correct_answer}」です。"
 
         return message, is_correct, correct_answer
 
